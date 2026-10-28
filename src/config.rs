@@ -37,6 +37,7 @@ pub const SECTIONS: &[(&str, &[Field])] = &[
         Field { key: "color_border", label: "Рамка", kind: Kind::Color, default: "#3A3D42" },
         Field { key: "color_text", label: "Текст", kind: Kind::Color, default: "#FFFFFF" },
         Field { key: "color_faded", label: "Текст (замолчал)", kind: Kind::Color, default: "#A5AAAF" },
+        Field { key: "color_join", label: "Текст (только зашёл)", kind: Kind::Color, default: "#4FC3F7" },
         Field { key: "color_talk", label: "Точка: канал", kind: Kind::Color, default: "#00E676" },
         Field { key: "color_whisper", label: "Точка: шёпот", kind: Kind::Color, default: "#FFB300" },
     ]),
@@ -60,6 +61,7 @@ pub const SECTIONS: &[(&str, &[Field])] = &[
         Field { key: "list_y", label: "Отступ по Y, px", kind: Kind::Int, default: "24" },
         Field { key: "list_width", label: "Ширина, px", kind: Kind::Int, default: "320" },
         Field { key: "list_font_px", label: "Размер шрифта, px", kind: Kind::Int, default: "20" },
+        Field { key: "list_join_secs", label: "Подсветка зашедшего, с", kind: Kind::Int, default: "15" },
     ]),
 ];
 

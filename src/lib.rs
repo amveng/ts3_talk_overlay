@@ -55,9 +55,12 @@ pub struct State {
     /// Host of the active tab, only to log server switches once.
     host: Option<String>,
     pub self_id: u16,
+    channel_id: u64,
     pub speakers: HashMap<u16, Speaker>,
     /// Everyone in our channel: (clid, nickname).
     pub channel: Vec<(u16, String)>,
+    /// When someone came into our channel, while they are highlighted.
+    pub joined: HashMap<u16, Instant>,
 }
 
 pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
@@ -94,8 +97,8 @@ fn nickname(sch: u64, clid: u16) -> String {
     name
 }
 
-/// Our own clid and everyone in our channel, or None when not connected.
-fn read_channel(sch: u64) -> Option<(u16, Vec<(u16, String)>)> {
+/// Our own clid, our channel and everyone in it, or None when not connected.
+fn read_channel(sch: u64) -> Option<(u16, u64, Vec<(u16, String)>)> {
     let f = TS3.get()?;
     let (mut me, mut cid, mut list) = (0u16, 0u64, std::ptr::null_mut::<u16>());
     unsafe {
@@ -113,7 +116,7 @@ fn read_channel(sch: u64) -> Option<(u16, Vec<(u16, String)>)> {
             p = p.add(1);
         }
         (f.free_memory)(list.cast());
-        Some((me, ids.into_iter().map(|id| (id, nickname(sch, id))).collect()))
+        Some((me, cid, ids.into_iter().map(|id| (id, nickname(sch, id))).collect()))
     }
 }
 
@@ -132,12 +135,24 @@ fn refresh_channel() {
     let current = unsafe { (f.get_current_server_connection_handler_id)() };
     let host = server_host(current);
     let sch = if host.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(SERVER)) { current } else { 0 };
-    let (me, channel) = if sch != 0 { read_channel(sch).unwrap_or_default() } else { Default::default() };
+    let (me, cid, channel) = if sch != 0 { read_channel(sch).unwrap_or_default() } else { Default::default() };
     {
         let mut s = lock(&STATE);
         if s.sch != sch {
             s.speakers.clear();
         }
+        // Only people arriving in the channel we already sit in; not everyone on connect or when
+        // we switch channels ourselves.
+        if s.sch == sch && !s.channel.is_empty() && s.channel_id == cid {
+            let now = Instant::now();
+            for (id, _) in &channel {
+                if !s.channel.iter().any(|c| c.0 == *id) {
+                    s.joined.insert(*id, now);
+                }
+            }
+        }
+        s.joined.retain(|id, _| channel.iter().any(|c| c.0 == *id));
+        s.channel_id = cid;
         if s.host != host {
             if let Some(h) = &host {
                 log(&format!("вкладка {current}: сервер {h}, {}", if sch != 0 { "работаю" } else { "пропускаю" }));
@@ -158,7 +173,7 @@ pub extern "C" fn ts3plugin_name() -> *const c_char {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ts3plugin_version() -> *const c_char {
-    c"0.1.0".as_ptr()
+    c"0.2.0".as_ptr()
 }
 
 #[unsafe(no_mangle)]
