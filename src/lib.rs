@@ -2,7 +2,7 @@
 //!
 //! "Кто говорит" lists current speakers, whispers on top and channel voice below; a nick
 //! lingers for a while after the person stops. "Список канала" lists everyone in our channel.
-//! Works on the active server tab, and only when it is connected to `SERVER`.
+//! Works on the active server tab.
 //! Settings live in `ts3_talk_overlay.ini` next to the DLL.
 
 use std::collections::HashMap;
@@ -27,8 +27,6 @@ const CLIENT_NICKNAME: usize = 1;
 const CLIENT_VOLUME_MODIFICATOR: usize = 18;
 /// Range of the per-client volume the overlay lets you set, dB.
 pub const VOLUME_RANGE: (i32, i32) = (-40, 20);
-/// The plugin only works on this server; other tabs are ignored.
-const SERVER: &str = "irreale.cleanvoice.ru";
 
 /// The few TS3Functions we call, by index in `struct TS3Functions` (ts3_functions.h, API 26).
 struct Ts3Fns {
@@ -164,12 +162,12 @@ fn server_host(sch: u64) -> Option<String> {
 }
 
 /// Re-reads the channel membership of the active tab. TS calls are made before taking the lock.
-/// A tab on any server other than `SERVER` counts as no tab (sch 0), so nothing is shown.
+/// A tab that is not connected counts as no tab (sch 0), so nothing is shown.
 fn refresh_channel() {
     let Some(f) = TS3.get() else { return };
     let current = unsafe { (f.get_current_server_connection_handler_id)() };
     let host = server_host(current);
-    let sch = if host.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(SERVER)) { current } else { 0 };
+    let sch = if host.is_some() { current } else { 0 };
     let (me, cid, channel) = if sch != 0 { read_channel(sch).unwrap_or_default() } else { Default::default() };
     {
         let mut s = lock(&STATE);
@@ -190,7 +188,7 @@ fn refresh_channel() {
         s.channel_id = cid;
         if s.host != host {
             if let Some(h) = &host {
-                log(&format!("вкладка {current}: сервер {h}, {}", if sch != 0 { "работаю" } else { "пропускаю" }));
+                log(&format!("вкладка {current}: сервер {h}"));
             }
             s.host = host;
         }
