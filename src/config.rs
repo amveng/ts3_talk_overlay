@@ -44,6 +44,7 @@ pub const SECTIONS: &[(&str, &[Field])] = &[
     ("Кто говорит", &[
         Field { key: "talk_enabled", label: "Включён", kind: Kind::Bool, default: "1" },
         Field { key: "talk_hotkey", label: "Горячая клавиша", kind: Kind::Text, default: "Ctrl+Alt+T" },
+        Field { key: "volume_hotkey", label: "Клавиша: громкость", kind: Kind::Text, default: "Ctrl+Alt+V" },
         Field { key: "talk_monitor", label: "Монитор", kind: Kind::Monitor, default: "0" },
         Field { key: "talk_corner", label: "Угол", kind: Kind::Choice(CORNERS), default: "3" },
         Field { key: "talk_x", label: "Отступ по X, px", kind: Kind::Int, default: "408" },

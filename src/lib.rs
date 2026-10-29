@@ -24,13 +24,18 @@ const STATUS_DISCONNECTED: c_int = 0;
 const STATUS_CONNECTION_ESTABLISHED: c_int = 4;
 const LEAVE_VISIBILITY: c_int = 2;
 const CLIENT_NICKNAME: usize = 1;
+const CLIENT_VOLUME_MODIFICATOR: usize = 18;
+/// Range of the per-client volume the overlay lets you set, dB.
+pub const VOLUME_RANGE: (i32, i32) = (-40, 20);
 /// The plugin only works on this server; other tabs are ignored.
 const SERVER: &str = "irreale.cleanvoice.ru";
 
 /// The few TS3Functions we call, by index in `struct TS3Functions` (ts3_functions.h, API 26).
 struct Ts3Fns {
     free_memory: unsafe extern "C" fn(*mut c_void) -> c_uint,
+    set_client_volume_modifier: unsafe extern "C" fn(u64, u16, f32) -> c_uint,
     get_client_id: unsafe extern "C" fn(u64, *mut u16) -> c_uint,
+    get_client_variable_as_int: unsafe extern "C" fn(u64, u16, usize, *mut c_int) -> c_uint,
     get_client_variable_as_string: unsafe extern "C" fn(u64, u16, usize, *mut *mut c_char) -> c_uint,
     get_channel_of_client: unsafe extern "C" fn(u64, u16, *mut u64) -> c_uint,
     get_channel_client_list: unsafe extern "C" fn(u64, u64, *mut *mut u16) -> c_uint,
@@ -46,6 +51,8 @@ pub struct Speaker {
     pub whisper: bool,
     /// When they started talking, or when they stopped if `talking` is false.
     pub since: Instant,
+    /// Our local volume adjustment for them, dB.
+    pub volume: i32,
 }
 
 #[derive(Default)]
@@ -95,6 +102,34 @@ fn nickname(sch: u64, clid: u16) -> String {
     let name = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
     unsafe { (f.free_memory)(p.cast()) };
     name
+}
+
+fn volume(sch: u64, clid: u16) -> i32 {
+    let Some(f) = TS3.get() else { return 0 };
+    let mut v: c_int = 0;
+    if unsafe { (f.get_client_variable_as_int)(sch, clid, CLIENT_VOLUME_MODIFICATOR, &mut v) } != 0 {
+        return 0;
+    }
+    v
+}
+
+/// Sets our local volume for a client on the active tab, clamped to `VOLUME_RANGE`.
+/// Called from the overlay thread.
+pub fn set_volume(clid: u16, db: i32) {
+    let Some(f) = TS3.get() else { return };
+    let db = db.clamp(VOLUME_RANGE.0, VOLUME_RANGE.1);
+    let sch = lock(&STATE).sch;
+    if sch == 0 {
+        return;
+    }
+    let err = unsafe { (f.set_client_volume_modifier)(sch, clid, db as f32) };
+    if err != 0 {
+        return log(&format!("не удалось изменить громкость clid {clid}: ошибка {err}"));
+    }
+    if let Some(sp) = lock(&STATE).speakers.get_mut(&clid) {
+        sp.volume = db;
+    }
+    overlay::refresh();
 }
 
 /// Our own clid, our channel and everyone in it, or None when not connected.
@@ -173,7 +208,7 @@ pub extern "C" fn ts3plugin_name() -> *const c_char {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ts3plugin_version() -> *const c_char {
-    c"0.2.0".as_ptr()
+    c"0.3.0".as_ptr()
 }
 
 #[unsafe(no_mangle)]
@@ -198,7 +233,9 @@ pub unsafe extern "C" fn ts3plugin_setFunctionPointers(funcs: *const *const c_vo
     unsafe {
         let _ = TS3.set(Ts3Fns {
             free_memory: std::mem::transmute(*funcs.add(5)),
+            set_client_volume_modifier: std::mem::transmute(*funcs.add(39)),
             get_client_id: std::mem::transmute(*funcs.add(73)),
+            get_client_variable_as_int: std::mem::transmute(*funcs.add(79)),
             get_client_variable_as_string: std::mem::transmute(*funcs.add(81)),
             get_channel_of_client: std::mem::transmute(*funcs.add(83)),
             get_channel_client_list: std::mem::transmute(*funcs.add(94)),
@@ -247,14 +284,15 @@ pub extern "C" fn ts3plugin_onConnectStatusChangeEvent(_sch: u64, new_status: c_
 #[unsafe(no_mangle)]
 pub extern "C" fn ts3plugin_onTalkStatusChangeEvent(sch: u64, status: c_int, is_received_whisper: c_int, client_id: u16) {
     let talking = status == STATUS_TALKING;
-    let name = if talking { nickname(sch, client_id) } else { String::new() };
+    let (name, vol) = if talking { (nickname(sch, client_id), volume(sch, client_id)) } else { (String::new(), 0) };
     {
         let mut s = lock(&STATE);
         if s.sch != sch {
             return;
         }
         if talking {
-            s.speakers.insert(client_id, Speaker { name, talking, whisper: is_received_whisper != 0, since: Instant::now() });
+            let speaker = Speaker { name, talking, whisper: is_received_whisper != 0, since: Instant::now(), volume: vol };
+            s.speakers.insert(client_id, speaker);
         } else if let Some(sp) = s.speakers.get_mut(&client_id) {
             sp.talking = false;
             sp.since = Instant::now(); // starts the linger countdown

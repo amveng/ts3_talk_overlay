@@ -7,9 +7,9 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW,
@@ -28,6 +28,10 @@ const CLASS: &str = "TsTalkOverlay";
 /// GWLP_USERDATA tags: index into `Ui::wins` + 1, or the control window.
 const KIND_CONTROL: isize = 10;
 const PREFIX: [&str; 2] = ["talk", "list"];
+/// Hotkey id of the volume mode; 1 and 2 toggle the windows.
+const HOTKEY_VOLUME: i32 = 3;
+/// The volume mode switches itself off after this long without a wheel or click.
+const VOLUME_IDLE: Duration = Duration::from_secs(10);
 
 static CONTROL: AtomicUsize = AtomicUsize::new(0);
 static THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
@@ -37,6 +41,8 @@ struct Ui {
     fonts: [HFONT; 2],
     /// Toggled by the hotkeys; not saved.
     hidden: [bool; 2],
+    /// Volume mode: "Кто говорит" takes the mouse; time of the last action while it is on.
+    volume_mode: Option<Instant>,
     cfg: Config,
 }
 
@@ -45,7 +51,8 @@ thread_local! {
 }
 
 enum Row {
-    Item { text: String, dot: u32, color: u32 },
+    /// `id` is the speaker under this row; `volume` is shown on the right in volume mode.
+    Item { text: String, dot: u32, color: u32, id: Option<u16>, volume: Option<i32> },
     Gap(i32),
 }
 
@@ -113,7 +120,7 @@ fn run(ready: mpsc::Sender<()>) {
             );
             SetWindowLongPtrW(*w, GWLP_USERDATA, i as isize + 1);
         }
-        UI.set(Some(Ui { wins, fonts: [std::ptr::null_mut(); 2], hidden: [false; 2], cfg: config::current() }));
+        UI.set(Some(Ui { wins, fonts: [std::ptr::null_mut(); 2], hidden: [false; 2], volume_mode: None, cfg: config::current() }));
         apply_config(ctrl);
         SetTimer(ctrl, 1, 500, None);
         CONTROL.store(ctrl as usize, Ordering::Release);
@@ -127,6 +134,7 @@ fn run(ready: mpsc::Sender<()>) {
         CONTROL.store(0, Ordering::Release);
         UnregisterHotKey(ctrl, 1);
         UnregisterHotKey(ctrl, 2);
+        UnregisterHotKey(ctrl, HOTKEY_VOLUME);
         if let Some(ui) = UI.take() {
             for i in 0..2 {
                 DestroyWindow(ui.wins[i]);
@@ -176,20 +184,77 @@ unsafe fn apply_config(ctrl: HWND) {
     });
     let alpha = (cfg.int("opacity").clamp(10, 100) * 255 / 100) as u8;
     for (i, w) in wins.into_iter().enumerate() {
-        unsafe {
-            SetLayeredWindowAttributes(w, 0, alpha, LWA_ALPHA);
-            UnregisterHotKey(ctrl, i as i32 + 1);
-            let key = cfg.get(&format!("{}_hotkey", PREFIX[i])).to_string();
-            if let Some((mods, vk)) = parse_hotkey(&key) {
-                if RegisterHotKey(ctrl, i as i32 + 1, mods | MOD_NOREPEAT, vk) == 0 {
-                    log(&format!("горячая клавиша {key} занята другой программой"));
-                }
-            } else if !key.trim().is_empty() {
-                log(&format!("не понял горячую клавишу '{key}'"));
+        unsafe { SetLayeredWindowAttributes(w, 0, alpha, LWA_ALPHA) };
+        register_hotkey(ctrl, i as i32 + 1, cfg.get(&format!("{}_hotkey", PREFIX[i])));
+    }
+    register_hotkey(ctrl, HOTKEY_VOLUME, cfg.get("volume_hotkey"));
+    layout_all();
+}
+
+fn register_hotkey(ctrl: HWND, id: i32, key: &str) {
+    unsafe {
+        UnregisterHotKey(ctrl, id);
+        if let Some((mods, vk)) = parse_hotkey(key) {
+            if RegisterHotKey(ctrl, id, mods | MOD_NOREPEAT, vk) == 0 {
+                log(&format!("горячая клавиша {key} занята другой программой"));
             }
+        } else if !key.trim().is_empty() {
+            log(&format!("не понял горячую клавишу '{key}'"));
         }
     }
-    layout_all();
+}
+
+fn volume_mode() -> bool {
+    UI.with_borrow(|ui| ui.as_ref().is_some_and(|u| u.volume_mode.is_some()))
+}
+
+/// Volume mode on: "Кто говорит" stops letting clicks through and shows each speaker's volume.
+fn set_volume_mode(on: bool) {
+    let Some(hwnd) = UI.with_borrow_mut(|ui| {
+        let ui = ui.as_mut()?;
+        ui.volume_mode = on.then(Instant::now);
+        Some(ui.wins[0])
+    }) else { return };
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let ex = if on { ex & !(WS_EX_TRANSPARENT as isize) } else { ex | WS_EX_TRANSPARENT as isize };
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+    }
+    layout(0);
+}
+
+/// Speaker on the "Кто говорит" row at client y, with their current volume.
+fn speaker_at(y: i32) -> Option<(u16, i32)> {
+    UI.with_borrow(|ui| {
+        let cfg = &ui.as_ref()?.cfg;
+        let n = rows(0, cfg, &lock(&STATE), true);
+        let (row_h, pad) = metrics(cfg.int("talk_font_px").max(6));
+        let mut top = pad;
+        for row in &n {
+            match row {
+                Row::Gap(g) => top += g,
+                Row::Item { id, volume, .. } => {
+                    if (top..top + row_h).contains(&y) {
+                        return Some(((*id)?, volume.unwrap_or(0)));
+                    }
+                    top += row_h;
+                }
+            }
+        }
+        None
+    })
+}
+
+/// Wheel notches (positive = louder) or a reset to 0 dB for the speaker at client y.
+fn adjust_volume(y: i32, notches: Option<i32>) {
+    UI.with_borrow_mut(|ui| {
+        if let Some(ui) = ui.as_mut().filter(|u| u.volume_mode.is_some()) {
+            ui.volume_mode = Some(Instant::now());
+        }
+    });
+    if let Some((id, current)) = speaker_at(y) {
+        crate::set_volume(id, notches.map_or(0, |n| current + n));
+    }
 }
 
 fn blend(a: u32, b: u32, t: f32) -> u32 {
@@ -200,7 +265,7 @@ fn blend(a: u32, b: u32, t: f32) -> u32 {
     ch(0) | ch(8) | ch(16)
 }
 
-fn rows(i: usize, cfg: &Config, st: &State) -> Vec<Row> {
+fn rows(i: usize, cfg: &Config, st: &State, volume_mode: bool) -> Vec<Row> {
     let me = (!cfg.bool("show_self")).then_some(st.self_id);
     let (text, faded, bg) = (cfg.color("color_text"), cfg.color("color_faded"), cfg.color("color_bg"));
     if i == 1 {
@@ -212,7 +277,7 @@ fn rows(i: usize, cfg: &Config, st: &State) -> Vec<Row> {
                 let talking = st.speakers.get(id).is_some_and(|s| s.talking && !s.whisper);
                 let dot = if talking { cfg.color("color_talk") } else { blend(faded, bg, 0.35) };
                 let color = if st.joined.contains_key(id) { cfg.color("color_join") } else { text };
-                Row::Item { text: name.clone(), dot, color }
+                Row::Item { text: name.clone(), dot, color, id: None, volume: None }
             })
             .collect();
     }
@@ -220,8 +285,8 @@ fn rows(i: usize, cfg: &Config, st: &State) -> Vec<Row> {
     // lingering ones, newest first.
     let mut out = Vec::new();
     for whisper in [true, false] {
-        let mut group: Vec<_> = st.speakers.iter().filter(|(id, s)| s.whisper == whisper && Some(**id) != me).map(|(_, s)| s).collect();
-        group.sort_by(|a, b| b.talking.cmp(&a.talking).then(a.since.elapsed().cmp(&b.since.elapsed())));
+        let mut group: Vec<_> = st.speakers.iter().filter(|(id, s)| s.whisper == whisper && Some(**id) != me).collect();
+        group.sort_by(|(_, a), (_, b)| b.talking.cmp(&a.talking).then(a.since.elapsed().cmp(&b.since.elapsed())));
         if group.is_empty() {
             continue;
         }
@@ -229,11 +294,17 @@ fn rows(i: usize, cfg: &Config, st: &State) -> Vec<Row> {
             out.push(Row::Gap(cfg.int("talk_gap").max(0)));
         }
         let dot = cfg.color(if whisper { "color_whisper" } else { "color_talk" });
-        out.extend(group.into_iter().map(|s| Row::Item {
+        out.extend(group.into_iter().map(|(id, s)| Row::Item {
             text: s.name.clone(),
             dot: if s.talking { dot } else { blend(dot, bg, 0.5) },
             color: if s.talking { text } else { faded },
+            id: Some(*id),
+            volume: volume_mode.then_some(s.volume),
         }));
+    }
+    if volume_mode && out.is_empty() {
+        let hint = "Громкость: никто не говорит".to_string();
+        out.push(Row::Item { text: hint, dot: bg, color: faded, id: None, volume: None });
     }
     out
 }
@@ -283,7 +354,7 @@ fn layout(i: usize) {
         let ui = ui.as_ref()?;
         let cfg = &ui.cfg;
         let p = PREFIX[i];
-        let n = rows(i, cfg, &lock(&STATE));
+        let n = rows(i, cfg, &lock(&STATE), i == 0 && ui.volume_mode.is_some());
         if ui.hidden[i] || !cfg.bool(&format!("{p}_enabled")) || n.is_empty() {
             return Some((ui.wins[i], None));
         }
@@ -332,7 +403,8 @@ unsafe fn paint(hwnd: HWND, i: usize) {
     UI.with_borrow(|ui| {
         let Some(ui) = ui.as_ref() else { return };
         let cfg = &ui.cfg;
-        let n = rows(i, cfg, &lock(&STATE));
+        let volume_mode = i == 0 && ui.volume_mode.is_some();
+        let n = rows(i, cfg, &lock(&STATE), volume_mode);
         let (row_h, pad) = metrics(cfg.int(&format!("{}_font_px", PREFIX[i])).max(6));
         let d = (pad).max(4);
         let bg = cfg.color("color_bg");
@@ -350,8 +422,11 @@ unsafe fn paint(hwnd: HWND, i: usize) {
             let brush = CreateSolidBrush(bg);
             FillRect(mem, &rc, brush);
             DeleteObject(brush);
-            let brush = CreateSolidBrush(cfg.color("color_border"));
-            FrameRect(mem, &rc, brush);
+            // volume mode: a thick frame in the talk colour, so it is obvious the window takes the mouse
+            let brush = CreateSolidBrush(cfg.color(if volume_mode { "color_talk" } else { "color_border" }));
+            for k in 0..if volume_mode { 3 } else { 1 } {
+                FrameRect(mem, &RECT { left: k, top: k, right: w - k, bottom: h - k }, brush);
+            }
             DeleteObject(brush);
             SetBkMode(mem, TRANSPARENT as i32);
 
@@ -359,11 +434,21 @@ unsafe fn paint(hwnd: HWND, i: usize) {
             for row in &n {
                 match row {
                     Row::Gap(g) => y += g,
-                    Row::Item { text, dot: c, color } => {
+                    Row::Item { text, dot: c, color, volume, .. } => {
                         dot(mem, pad, y + (row_h - d) / 2, d, *c, bg);
+                        let mut right = w - pad;
+                        if let Some(v) = volume {
+                            let mut t: Vec<u16> = format!("{v:+} дБ").replace("+0", "0").encode_utf16().collect();
+                            let mut size = SIZE { cx: 0, cy: 0 };
+                            GetTextExtentPoint32W(mem, t.as_ptr(), t.len() as i32, &mut size);
+                            SetTextColor(mem, cfg.color(if *v == 0 { "color_faded" } else { "color_whisper" }));
+                            let mut r = RECT { left: right - size.cx, top: y, right, bottom: y + row_h };
+                            DrawTextW(mem, t.as_mut_ptr(), t.len() as i32, &mut r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                            right -= size.cx + pad;
+                        }
                         SetTextColor(mem, *color);
                         let mut t: Vec<u16> = text.encode_utf16().collect();
-                        let mut r = RECT { left: pad * 2 + d, top: y, right: w - pad, bottom: y + row_h };
+                        let mut r = RECT { left: pad * 2 + d, top: y, right, bottom: y + row_h };
                         DrawTextW(mem, t.as_mut_ptr(), t.len() as i32, &mut r, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
                         y += row_h;
                     }
@@ -380,14 +465,20 @@ unsafe fn paint(hwnd: HWND, i: usize) {
     });
 }
 
-/// Drops lingering speakers and join highlights whose time is up.
+/// Drops lingering speakers and join highlights whose time is up, and ends an idle volume mode.
+/// While the volume mode is on nobody is dropped, so the row under the mouse stays put.
 fn expire() {
+    let idle = UI.with_borrow(|ui| ui.as_ref().and_then(|u| u.volume_mode).map(|t| t.elapsed()));
+    if idle.is_some_and(|t| t >= VOLUME_IDLE) {
+        set_volume_mode(false);
+    }
+    let volume_mode = volume_mode();
     let secs = |key: &str| Duration::from_secs(UI.with_borrow(|ui| ui.as_ref().map_or(15, |u| u.cfg.int(key).max(0) as u64)));
     let (linger, join) = (secs("linger"), secs("list_join_secs"));
     let changed = {
         let mut s = lock(&STATE);
         let before = (s.speakers.len(), s.joined.len());
-        s.speakers.retain(|_, sp| sp.talking || sp.since.elapsed() < linger);
+        s.speakers.retain(|_, sp| volume_mode || sp.talking || sp.since.elapsed() < linger);
         s.joined.retain(|_, t| t.elapsed() < join);
         (s.speakers.len(), s.joined.len()) != before
     };
@@ -402,6 +493,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         match (kind, msg) {
             (1 | 2, WM_PAINT) => paint(hwnd, kind as usize - 1),
             (1 | 2, WM_ERASEBKGND) => return 1,
+            // the window only gets the mouse in volume mode; it must never take focus from the game
+            (1, WM_MOUSEACTIVATE) => return MA_NOACTIVATE as LRESULT,
+            (1, WM_MOUSEWHEEL) => {
+                let mut pt = POINT { x: (lp & 0xffff) as i16 as i32, y: (lp >> 16 & 0xffff) as i16 as i32 };
+                ScreenToClient(hwnd, &mut pt);
+                let delta = (wp >> 16 & 0xffff) as i16 as i32;
+                adjust_volume(pt.y, Some(delta.signum() * (delta.abs() / 120).max(1)));
+            }
+            (1, WM_RBUTTONUP) => adjust_volume((lp >> 16 & 0xffff) as i16 as i32, None),
+            (KIND_CONTROL, WM_HOTKEY) if wp == HOTKEY_VOLUME as usize => set_volume_mode(!volume_mode()),
             (KIND_CONTROL, WM_APP_REFRESH) => layout_all(),
             (KIND_CONTROL, WM_APP_RELOAD) => apply_config(hwnd),
             (KIND_CONTROL, WM_TIMER) => expire(),
