@@ -23,6 +23,7 @@ const STATUS_TALKING: c_int = 1;
 const STATUS_DISCONNECTED: c_int = 0;
 const STATUS_CONNECTION_ESTABLISHED: c_int = 4;
 const LEAVE_VISIBILITY: c_int = 2;
+const CLIENT_UNIQUE_IDENTIFIER: usize = 0;
 const CLIENT_NICKNAME: usize = 1;
 const CLIENT_VOLUME_MODIFICATOR: usize = 18;
 /// Range of the per-client volume the overlay lets you set, dB.
@@ -69,6 +70,21 @@ pub struct State {
 }
 
 pub static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
+
+/// Volumes set from the overlay. TS neither remembers setClientVolumeModifier across
+/// reconnects nor reflects it in CLIENT_VOLUME_MODIFICATOR, so we keep them ourselves, by
+/// unique id, in `ts3_talk_overlay_volumes.txt` next to the DLL.
+struct Volumes {
+    /// uid -> (our dB, TS's own value when we set it). If TS's value later differs, the
+    /// volume was changed in TS's own window and that wins.
+    saved: HashMap<String, (i32, i32)>,
+    /// Live clids we set or re-applied a volume for -> what TS reported right after; a
+    /// rejoin gets a new clid.
+    echo: HashMap<u16, i32>,
+}
+
+static VOLUMES: LazyLock<Mutex<Volumes>> =
+    LazyLock::new(|| Mutex::new(Volumes { saved: load_volumes(), echo: HashMap::new() }));
 pub static PLUGIN_DIR: LazyLock<PathBuf> = LazyLock::new(plugin_dir);
 
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -91,18 +107,48 @@ pub fn log(msg: &str) {
     }
 }
 
-fn nickname(sch: u64, clid: u16) -> String {
-    let Some(f) = TS3.get() else { return String::new() };
+fn client_string(sch: u64, clid: u16, flag: usize) -> Option<String> {
+    let f = TS3.get()?;
     let mut p: *mut c_char = std::ptr::null_mut();
-    if unsafe { (f.get_client_variable_as_string)(sch, clid, CLIENT_NICKNAME, &mut p) } != 0 || p.is_null() {
-        return format!("clid {clid}");
+    if unsafe { (f.get_client_variable_as_string)(sch, clid, flag, &mut p) } != 0 || p.is_null() {
+        return None;
     }
-    let name = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+    let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
     unsafe { (f.free_memory)(p.cast()) };
-    name
+    Some(s)
 }
 
-fn volume(sch: u64, clid: u16) -> i32 {
+fn nickname(sch: u64, clid: u16) -> String {
+    client_string(sch, clid, CLIENT_NICKNAME).unwrap_or_else(|| format!("clid {clid}"))
+}
+
+fn volumes_path() -> PathBuf {
+    PLUGIN_DIR.join(format!("{NAME}_volumes.txt"))
+}
+
+/// Lines `uid<TAB>dB<TAB>TS value`; anything else is skipped.
+fn load_volumes() -> HashMap<String, (i32, i32)> {
+    let text = std::fs::read_to_string(volumes_path()).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let mut p = l.split('\t');
+            Some((p.next()?.to_string(), (p.next()?.parse().ok()?, p.next()?.parse().ok()?)))
+        })
+        .collect()
+}
+
+fn save_volumes(saved: &HashMap<String, (i32, i32)>) {
+    let mut text = String::from("; Громкость, выставленная из оверлея: уникальный ID, дБ, значение TS на тот момент.\n");
+    for (uid, (db, ts)) in saved {
+        text.push_str(&format!("{uid}\t{db}\t{ts}\n"));
+    }
+    if let Err(e) = std::fs::write(volumes_path(), text) {
+        log(&format!("не удалось сохранить громкость: {e}"));
+    }
+}
+
+/// CLIENT_VOLUME_MODIFICATOR: changes only when the volume is set in TS's own UI.
+fn ts_volume(sch: u64, clid: u16) -> i32 {
     let Some(f) = TS3.get() else { return 0 };
     let mut v: c_int = 0;
     if unsafe { (f.get_client_variable_as_int)(sch, clid, CLIENT_VOLUME_MODIFICATOR, &mut v) } != 0 {
@@ -111,18 +157,75 @@ fn volume(sch: u64, clid: u16) -> i32 {
     v
 }
 
-/// Sets our local volume for a client on the active tab, clamped to `VOLUME_RANGE`.
+fn set_modifier(sch: u64, clid: u16, db: i32) -> bool {
+    let Some(f) = TS3.get() else { return false };
+    let err = unsafe { (f.set_client_volume_modifier)(sch, clid, db as f32) };
+    if err != 0 {
+        log(&format!("не удалось изменить громкость clid {clid}: ошибка {err}"));
+    }
+    err == 0
+}
+
+/// Our volume for a client: the one saved from the overlay, unless it was changed in TS since.
+/// The first time a clid is seen, the saved volume is applied to TS (it forgets it on rejoin).
+fn volume(sch: u64, clid: u16) -> i32 {
+    let v = ts_volume(sch, clid);
+    let Some(uid) = client_string(sch, clid, CLIENT_UNIQUE_IDENTIFIER) else { return v };
+    let mut vols = lock(&VOLUMES);
+    let Some(&(ours, base)) = vols.saved.get(&uid) else { return v };
+    // A live clid must still show what TS reported right after our own change; a new clid
+    // (rejoin, TS restart) must show TS's own remembered value from before our change.
+    let (expected, first) = match vols.echo.get(&clid) {
+        Some(&e) => (e, false),
+        None => (base, true),
+    };
+    if v != expected {
+        log(&format!("громкость {uid} изменена в TeamSpeak: {v} дБ (ждал {expected}), значение из оверлея {ours} дБ забыто"));
+        vols.saved.remove(&uid);
+        vols.echo.remove(&clid);
+        save_volumes(&vols.saved);
+        return v;
+    }
+    if first {
+        drop(vols);
+        set_modifier(sch, clid, ours);
+        let echo = ts_volume(sch, clid);
+        log(&format!("громкость {uid}: восстановлена {ours} дБ (в TS было {v}, стало {echo})"));
+        lock(&VOLUMES).echo.insert(clid, echo);
+    }
+    ours
+}
+
+/// Sets and saves our local volume for a client on the active tab, clamped to `VOLUME_RANGE`.
 /// Called from the overlay thread.
 pub fn set_volume(clid: u16, db: i32) {
-    let Some(f) = TS3.get() else { return };
     let db = db.clamp(VOLUME_RANGE.0, VOLUME_RANGE.1);
     let sch = lock(&STATE).sch;
     if sch == 0 {
         return;
     }
-    let err = unsafe { (f.set_client_volume_modifier)(sch, clid, db as f32) };
-    if err != 0 {
-        return log(&format!("не удалось изменить громкость clid {clid}: ошибка {err}"));
+    let Some(uid) = client_string(sch, clid, CLIENT_UNIQUE_IDENTIFIER) else {
+        return log(&format!("не удалось узнать уникальный ID clid {clid}, громкость не изменена"));
+    };
+    let v = ts_volume(sch, clid);
+    // TS's own value from before the overlay touched this person: kept while TS still shows
+    // what our previous change left there.
+    let base = {
+        let vols = lock(&VOLUMES);
+        match (vols.saved.get(&uid), vols.echo.get(&clid)) {
+            (Some(&(_, b)), Some(&e)) if v == e => b,
+            _ => v,
+        }
+    };
+    if !set_modifier(sch, clid, db) {
+        return;
+    }
+    let echo = ts_volume(sch, clid);
+    {
+        let mut vols = lock(&VOLUMES);
+        vols.saved.insert(uid, (db, base));
+        vols.echo.insert(clid, echo);
+        save_volumes(&vols.saved);
     }
     if let Some(sp) = lock(&STATE).speakers.get_mut(&clid) {
         sp.volume = db;
@@ -169,6 +272,13 @@ fn refresh_channel() {
     let host = server_host(current);
     let sch = if host.is_some() { current } else { 0 };
     let (me, cid, channel) = if sch != 0 { read_channel(sch).unwrap_or_default() } else { Default::default() };
+    if lock(&STATE).sch != sch {
+        lock(&VOLUMES).echo.clear();
+    }
+    // apply saved volumes as people show up in our channel, before they start talking
+    for (id, _) in &channel {
+        volume(sch, *id);
+    }
     {
         let mut s = lock(&STATE);
         if s.sch != sch {
@@ -206,7 +316,7 @@ pub extern "C" fn ts3plugin_name() -> *const c_char {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ts3plugin_version() -> *const c_char {
-    c"0.3.0".as_ptr()
+    c"0.3.1".as_ptr()
 }
 
 #[unsafe(no_mangle)]
@@ -307,6 +417,7 @@ fn on_move(sch: u64, client_id: u16, visibility: c_int) {
         }
         if visibility == LEAVE_VISIBILITY {
             s.speakers.remove(&client_id); // clids get recycled
+            lock(&VOLUMES).echo.remove(&client_id);
         }
     }
     refresh_channel();
@@ -365,4 +476,121 @@ pub extern "C" fn ts3plugin_onClientDisplayNameChanged(sch: u64, client_id: u16,
         }
     }
     overlay::refresh();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    /// Fake TS. CLIENT_VOLUME_MODIFICATOR per live clid; a clid it has no entry for shows
+    /// `REMEMBERED`, TS's own stored volume for the person (what a rejoin starts with).
+    static VARS: LazyLock<Mutex<HashMap<u16, i32>>> = LazyLock::new(Default::default);
+    static REMEMBERED: AtomicI32 = AtomicI32::new(0);
+    /// Whether setClientVolumeModifier also updates CLIENT_VOLUME_MODIFICATOR.
+    static SET_UPDATES_VAR: AtomicBool = AtomicBool::new(false);
+    /// Last value passed to setClientVolumeModifier, i32::MIN = not called.
+    static LAST_SET: AtomicI32 = AtomicI32::new(i32::MIN);
+
+    unsafe extern "C" fn get_int(_: u64, clid: u16, _: usize, v: *mut c_int) -> c_uint {
+        let val = lock(&VARS).get(&clid).copied().unwrap_or(REMEMBERED.load(Ordering::Relaxed));
+        unsafe { *v = val };
+        0
+    }
+    unsafe extern "C" fn set_mod(_: u64, clid: u16, db: f32) -> c_uint {
+        LAST_SET.store(db as i32, Ordering::Relaxed);
+        if SET_UPDATES_VAR.load(Ordering::Relaxed) {
+            lock(&VARS).insert(clid, db as i32);
+        }
+        0
+    }
+    /// clid 6 is someone else; every other clid is the same person (rejoins get new clids).
+    unsafe extern "C" fn get_str(_: u64, clid: u16, _: usize, out: *mut *mut c_char) -> c_uint {
+        let uid = if clid == 6 { "other=" } else { "same+person/uid=" };
+        unsafe { *out = CString::new(uid).unwrap().into_raw() };
+        0
+    }
+    unsafe extern "C" fn free(p: *mut c_void) -> c_uint {
+        drop(unsafe { CString::from_raw(p.cast()) });
+        0
+    }
+    unsafe extern "C" fn fail_id(_: u64, _: *mut u16) -> c_uint {
+        1
+    }
+    unsafe extern "C" fn fail_chan(_: u64, _: u16, _: *mut u64) -> c_uint {
+        1
+    }
+    unsafe extern "C" fn fail_list(_: u64, _: u64, _: *mut *mut u16) -> c_uint {
+        1
+    }
+    unsafe extern "C" fn sch() -> u64 {
+        1
+    }
+    unsafe extern "C" fn fail_info(_: u64, _: *mut c_char, _: *mut u16, _: *mut c_char, _: usize) -> c_uint {
+        1
+    }
+
+    fn scenario(set_updates_var: bool) {
+        let mode = if set_updates_var { "TS updates its variable" } else { "TS keeps its variable" };
+        let _ = std::fs::remove_file(volumes_path());
+        {
+            let mut vols = lock(&VOLUMES);
+            vols.saved.clear();
+            vols.echo.clear();
+        }
+        lock(&VARS).clear();
+        REMEMBERED.store(0, Ordering::Relaxed);
+        SET_UPDATES_VAR.store(set_updates_var, Ordering::Relaxed);
+        lock(&STATE).sch = 1;
+
+        set_volume(5, -7);
+        set_volume(5, -8); // second wheel notch
+        assert_eq!(volume(1, 5), -8, "{mode}: talks again");
+        assert_eq!(volume(1, 6), 0, "{mode}: other people keep TS's value");
+
+        // rejoin: new clid, TS shows its own remembered value -> ours is applied again
+        lock(&VARS).remove(&5);
+        LAST_SET.store(i32::MIN, Ordering::Relaxed);
+        assert_eq!(volume(1, 15), -8, "{mode}: after rejoin");
+        assert_eq!(LAST_SET.load(Ordering::Relaxed), -8, "{mode}: re-applied to TS");
+        LAST_SET.store(i32::MIN, Ordering::Relaxed);
+        assert_eq!(volume(1, 15), -8);
+        assert_eq!(LAST_SET.load(Ordering::Relaxed), i32::MIN, "{mode}: applied only once per clid");
+
+        // TS restart: only the file is left
+        lock(&VARS).clear();
+        {
+            let mut vols = lock(&VOLUMES);
+            vols.saved = load_volumes();
+            vols.echo.clear();
+        }
+        assert_eq!(volume(1, 25), -8, "{mode}: after TS restart");
+
+        // changed in TS's own volume window while they are here
+        lock(&VARS).insert(25, 3);
+        REMEMBERED.store(3, Ordering::Relaxed);
+        assert_eq!(volume(1, 25), 3, "{mode}: TS window wins");
+        assert!(load_volumes().is_empty(), "{mode}: overlay value forgotten");
+        lock(&VARS).remove(&25);
+        assert_eq!(volume(1, 35), 3, "{mode}: and stays forgotten after rejoin");
+    }
+
+    #[test]
+    fn volume_from_overlay_is_kept_across_talks_rejoins_and_restarts_until_changed_in_ts() {
+        let _ = TS3.set(Ts3Fns {
+            free_memory: free,
+            set_client_volume_modifier: set_mod,
+            get_client_id: fail_id,
+            get_client_variable_as_int: get_int,
+            get_client_variable_as_string: get_str,
+            get_channel_of_client: fail_chan,
+            get_channel_client_list: fail_list,
+            get_current_server_connection_handler_id: sch,
+            get_server_connect_info: fail_info,
+        });
+        // one test, both modes in turn: they share the plugin's statics
+        scenario(true);
+        scenario(false);
+    }
 }

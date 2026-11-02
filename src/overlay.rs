@@ -15,7 +15,8 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey,
+    MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, TME_LEAVE, TRACKMOUSEEVENT,
+    ReleaseCapture, SetCapture, TrackMouseEvent, UnregisterHotKey,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -24,12 +25,21 @@ use crate::{STATE, State, lock, log};
 
 const WM_APP_REFRESH: u32 = WM_APP + 1;
 const WM_APP_RELOAD: u32 = WM_APP + 2;
+/// windows-sys keeps this one behind the Win32_UI_Controls feature.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 const CLASS: &str = "TsTalkOverlay";
 /// GWLP_USERDATA tags: index into `Ui::wins` + 1, or the control window.
 const KIND_CONTROL: isize = 10;
 const PREFIX: [&str; 2] = ["talk", "list"];
 /// Hotkey id of the volume mode; 1 and 2 toggle the windows.
 const HOTKEY_VOLUME: i32 = 3;
+const HOTKEY_ARRANGE: i32 = 4;
+/// Arrange mode: how close to a window's edge a press resizes instead of moving it.
+const EDGE: i32 = 10;
+const LEFT: u8 = 1;
+const RIGHT: u8 = 2;
+const TOP: u8 = 4;
+const BOTTOM: u8 = 8;
 /// The volume mode switches itself off after this long without a wheel or click.
 const VOLUME_IDLE: Duration = Duration::from_secs(10);
 
@@ -43,7 +53,29 @@ struct Ui {
     hidden: [bool; 2],
     /// Volume mode: "Кто говорит" takes the mouse; time of the last action while it is on.
     volume_mode: Option<Instant>,
+    /// "Кто говорит" rows as they were when the mouse came over it in volume mode. While the
+    /// mouse stays there the list keeps this order and size, so the wheel never lands on
+    /// someone else because a new speaker re-sorted it.
+    frozen: Option<Vec<Frozen>>,
+    /// Arrange mode: both windows take the mouse and are moved and resized with it.
+    arrange: bool,
+    drag: Option<Drag>,
     cfg: Config,
+}
+
+/// A press in arrange mode: which window, which edges it grabbed (none = move), where the
+/// cursor and the window were then.
+struct Drag {
+    win: usize,
+    edges: u8,
+    start: POINT,
+    rect: RECT,
+    font: i32,
+}
+
+enum Frozen {
+    Speaker { id: u16, whisper: bool, name: String },
+    Gap(i32),
 }
 
 thread_local! {
@@ -120,7 +152,7 @@ fn run(ready: mpsc::Sender<()>) {
             );
             SetWindowLongPtrW(*w, GWLP_USERDATA, i as isize + 1);
         }
-        UI.set(Some(Ui { wins, fonts: [std::ptr::null_mut(); 2], hidden: [false; 2], volume_mode: None, cfg: config::current() }));
+        UI.set(Some(Ui { wins, fonts: [std::ptr::null_mut(); 2], hidden: [false; 2], volume_mode: None, frozen: None, arrange: false, drag: None, cfg: config::current() }));
         apply_config(ctrl);
         SetTimer(ctrl, 1, 500, None);
         CONTROL.store(ctrl as usize, Ordering::Release);
@@ -135,6 +167,7 @@ fn run(ready: mpsc::Sender<()>) {
         UnregisterHotKey(ctrl, 1);
         UnregisterHotKey(ctrl, 2);
         UnregisterHotKey(ctrl, HOTKEY_VOLUME);
+        UnregisterHotKey(ctrl, HOTKEY_ARRANGE);
         if let Some(ui) = UI.take() {
             for i in 0..2 {
                 DestroyWindow(ui.wins[i]);
@@ -170,14 +203,8 @@ unsafe fn apply_config(ctrl: HWND) {
         for i in 0..2 {
             unsafe {
                 DeleteObject(ui.fonts[i]);
-                let px = cfg.int(&format!("{}_font_px", PREFIX[i])).max(6);
-                ui.fonts[i] = CreateFontW(
-                    -px, 0, 0, 0, if cfg.bool("bold") { 700 } else { 400 }, 0, 0, 0,
-                    DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32,
-                    CLEARTYPE_QUALITY as u32, DEFAULT_PITCH as u32,
-                    wide(cfg.get("font")).as_ptr(),
-                );
             }
+            ui.fonts[i] = make_font(&cfg, i);
         }
         ui.cfg = cfg.clone();
         ui.wins
@@ -188,7 +215,20 @@ unsafe fn apply_config(ctrl: HWND) {
         register_hotkey(ctrl, i as i32 + 1, cfg.get(&format!("{}_hotkey", PREFIX[i])));
     }
     register_hotkey(ctrl, HOTKEY_VOLUME, cfg.get("volume_hotkey"));
+    register_hotkey(ctrl, HOTKEY_ARRANGE, cfg.get("arrange_hotkey"));
     layout_all();
+}
+
+fn make_font(cfg: &Config, i: usize) -> HFONT {
+    let px = cfg.int(&format!("{}_font_px", PREFIX[i])).max(6);
+    unsafe {
+        CreateFontW(
+            -px, 0, 0, 0, if cfg.bool("bold") { 700 } else { 400 }, 0, 0, 0,
+            DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32, CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32, DEFAULT_PITCH as u32,
+            wide(cfg.get("font")).as_ptr(),
+        )
+    }
 }
 
 fn register_hotkey(ctrl: HWND, id: i32, key: &str) {
@@ -210,24 +250,195 @@ fn volume_mode() -> bool {
 
 /// Volume mode on: "Кто говорит" stops letting clicks through and shows each speaker's volume.
 fn set_volume_mode(on: bool) {
+    if on && arranging() {
+        set_arrange(false);
+    }
     let Some(hwnd) = UI.with_borrow_mut(|ui| {
         let ui = ui.as_mut()?;
         ui.volume_mode = on.then(Instant::now);
+        ui.frozen = None;
         Some(ui.wins[0])
     }) else { return };
+    click_through(hwnd, !on);
+    layout(0);
+}
+
+fn click_through(hwnd: HWND, on: bool) {
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let ex = if on { ex & !(WS_EX_TRANSPARENT as isize) } else { ex | WS_EX_TRANSPARENT as isize };
+        let ex = if on { ex | WS_EX_TRANSPARENT as isize } else { ex & !(WS_EX_TRANSPARENT as isize) };
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
     }
-    layout(0);
+}
+
+fn arranging() -> bool {
+    UI.with_borrow(|ui| ui.as_ref().is_some_and(|u| u.arrange))
+}
+
+/// Arrange mode on: both windows show up (with sample rows if empty) and take the mouse.
+fn set_arrange(on: bool) {
+    if on {
+        set_volume_mode(false);
+    }
+    let Some(wins) = UI.with_borrow_mut(|ui| {
+        let ui = ui.as_mut()?;
+        ui.arrange = on;
+        ui.drag = None;
+        Some(ui.wins)
+    }) else { return };
+    if !on {
+        unsafe { ReleaseCapture() };
+    }
+    for w in wins {
+        click_through(w, !on);
+    }
+    layout_all();
+}
+
+/// Which edges of window `hwnd` are near client point (x, y); 0 = the middle.
+fn edges_at(hwnd: HWND, x: i32, y: i32) -> u8 {
+    let mut rc: RECT = unsafe { std::mem::zeroed() };
+    unsafe { GetClientRect(hwnd, &mut rc) };
+    let mut e = 0;
+    if x < EDGE {
+        e |= LEFT;
+    } else if x >= rc.right - EDGE {
+        e |= RIGHT;
+    }
+    if y < EDGE {
+        e |= TOP;
+    } else if y >= rc.bottom - EDGE {
+        e |= BOTTOM;
+    }
+    e
+}
+
+fn edge_cursor(e: u8) -> windows_sys::core::PCWSTR {
+    match e {
+        0 => IDC_SIZEALL,
+        LEFT | RIGHT => IDC_SIZEWE,
+        TOP | BOTTOM => IDC_SIZENS,
+        e if e == LEFT | TOP || e == RIGHT | BOTTOM => IDC_SIZENWSE,
+        _ => IDC_SIZENESW,
+    }
+}
+
+fn start_drag(hwnd: HWND, i: usize, x: i32, y: i32) {
+    let edges = edges_at(hwnd, x, y);
+    let mut start = POINT { x: 0, y: 0 };
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    unsafe {
+        GetCursorPos(&mut start);
+        GetWindowRect(hwnd, &mut rect);
+        SetCapture(hwnd);
+    }
+    UI.with_borrow_mut(|ui| {
+        if let Some(ui) = ui.as_mut().filter(|u| u.arrange) {
+            let font = ui.cfg.int(&format!("{}_font_px", PREFIX[i])).max(6);
+            ui.drag = Some(Drag { win: i, edges, start, rect, font });
+        }
+    });
+}
+
+/// Follows the cursor during a drag: moves the window or resizes it. The sides change the
+/// width; the top and bottom change the font size, and the height follows the rows. The result
+/// goes straight into the window's settings as monitor, corner and offsets.
+fn drag_move() {
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut pt) };
+    let Some(i) = UI.with_borrow_mut(|ui| {
+        let ui = ui.as_mut()?;
+        let d = ui.drag.as_ref()?;
+        let (i, r, p) = (d.win, d.rect, PREFIX[d.win]);
+        let (dx, dy) = (pt.x - d.start.x, pt.y - d.start.y);
+        let (mut x, mut y, mut w) = (r.left, r.top, r.right - r.left);
+        if d.edges == 0 {
+            x += dx;
+            y += dy;
+        }
+        if d.edges & LEFT != 0 {
+            w = (w - dx).max(80);
+            x = r.right - w;
+        }
+        if d.edges & RIGHT != 0 {
+            w = (w + dx).max(80);
+        }
+        let mut font = d.font;
+        if d.edges & (TOP | BOTTOM) != 0 {
+            let h0 = (r.bottom - r.top).max(1);
+            let dh = if d.edges & TOP != 0 { -dy } else { dy };
+            font = (d.font * (h0 + dh) / h0).clamp(8, 96);
+        }
+        let (edges, top, bottom) = (d.edges, r.top, r.bottom);
+        if font != ui.cfg.int(&format!("{p}_font_px")) {
+            set_key(&mut ui.cfg, &format!("{p}_font_px"), font);
+            unsafe { DeleteObject(ui.fonts[i]) };
+            ui.fonts[i] = make_font(&ui.cfg, i);
+        }
+        let (row_h, pad) = metrics(font);
+        let h = pad * 2 + rows_height(&shown_rows(ui, i), row_h);
+        if edges & TOP != 0 {
+            y = bottom - h;
+        } else if edges != 0 {
+            y = top;
+        }
+        store_position(&mut ui.cfg, i, x, y, w, h);
+        Some(i)
+    }) else { return };
+    layout(i);
+}
+
+/// End of a drag: the new position and size go into the ini.
+fn end_drag() {
+    let Some(i) = UI.with_borrow_mut(|ui| ui.as_mut()?.drag.take().map(|d| d.win)) else { return };
+    unsafe { ReleaseCapture() };
+    let p = PREFIX[i];
+    let keys = ["monitor", "corner", "x", "y", "width", "font_px"].map(|k| format!("{p}_{k}"));
+    UI.with_borrow(|ui| {
+        let Some(ui) = ui.as_ref() else { return };
+        let mut cfg = lock(&config::CONFIG);
+        for k in &keys {
+            set_key(&mut cfg, k, ui.cfg.int(k));
+        }
+        cfg.save();
+    });
+}
+
+fn set_key(cfg: &mut Config, key: &str, v: i32) {
+    if let Some(f) = config::fields().find(|f| f.key == key) {
+        cfg.set(f.key, v.to_string());
+    }
+}
+
+/// Screen rect -> the monitor it is on, the nearest corner of that monitor and offsets from it.
+fn store_position(cfg: &mut Config, i: usize, x: i32, y: i32, w: i32, h: i32) {
+    let p = PREFIX[i];
+    let mons = monitors();
+    let (cx, cy) = (x + w / 2, y + h / 2);
+    let Some(k) = mons
+        .iter()
+        .position(|m| (m.left..m.right).contains(&cx) && (m.top..m.bottom).contains(&cy))
+        .or_else(|| mons.iter().position(|m| (m.left..m.right).contains(&cx)))
+        .or_else(|| (!mons.is_empty()).then(|| if cx < mons[0].left { 0 } else { mons.len() - 1 }))
+    else { return };
+    let m = mons[k];
+    let old = cfg.int(&format!("{p}_monitor"));
+    // "Самый правый" stays as it is while the window stays on the rightmost monitor
+    let monitor = if k == mons.len() - 1 && !(1..=mons.len() as i32).contains(&old) { old } else { k as i32 + 1 };
+    let (left, top) = (cx < (m.left + m.right) / 2, cy < (m.top + m.bottom) / 2);
+    set_key(cfg, &format!("{p}_monitor"), monitor);
+    set_key(cfg, &format!("{p}_corner"), !left as i32 + 2 * !top as i32);
+    set_key(cfg, &format!("{p}_x"), if left { x - m.left } else { m.right - x - w });
+    set_key(cfg, &format!("{p}_y"), if top { y - m.top } else { m.bottom - y - h });
+    set_key(cfg, &format!("{p}_width"), w);
 }
 
 /// Speaker on the "Кто говорит" row at client y, with their current volume.
 fn speaker_at(y: i32) -> Option<(u16, i32)> {
     UI.with_borrow(|ui| {
-        let cfg = &ui.as_ref()?.cfg;
-        let n = rows(0, cfg, &lock(&STATE), true);
+        let ui = ui.as_ref()?;
+        let cfg = &ui.cfg;
+        let n = rows(0, cfg, &lock(&STATE), true, ui.frozen.as_deref());
         let (row_h, pad) = metrics(cfg.int("talk_font_px").max(6));
         let mut top = pad;
         for row in &n {
@@ -257,6 +468,43 @@ fn adjust_volume(y: i32, notches: Option<i32>) {
     }
 }
 
+/// Mouse over "Кто говорит" in volume mode: freeze the rows until it leaves.
+fn freeze(hwnd: HWND) {
+    let froze = UI.with_borrow_mut(|ui| {
+        let ui = ui.as_mut().filter(|u| u.volume_mode.is_some() && u.frozen.is_none())?;
+        let st = lock(&STATE);
+        let frozen: Vec<Frozen> = rows(0, &ui.cfg, &st, true, None)
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Gap(g) => Some(Frozen::Gap(g)),
+                Row::Item { id: Some(id), text, .. } => {
+                    Some(Frozen::Speaker { id, whisper: st.speakers.get(&id).is_some_and(|s| s.whisper), name: text })
+                }
+                Row::Item { id: None, .. } => None,
+            })
+            .collect();
+        // "никто не говорит": nothing to hold still, and freezing would hide the first speaker
+        if !frozen.iter().any(|f| matches!(f, Frozen::Speaker { .. })) {
+            return None;
+        }
+        ui.frozen = Some(frozen);
+        Some(())
+    });
+    if froze.is_some() {
+        let mut tme = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+        unsafe { TrackMouseEvent(&mut tme) };
+    }
+}
+
+fn unfreeze() {
+    UI.with_borrow_mut(|ui| {
+        if let Some(ui) = ui.as_mut() {
+            ui.frozen = None;
+        }
+    });
+    layout(0);
+}
+
 fn blend(a: u32, b: u32, t: f32) -> u32 {
     let ch = |s: u32| {
         let (x, y) = ((a >> s & 0xff) as f32, (b >> s & 0xff) as f32);
@@ -265,9 +513,32 @@ fn blend(a: u32, b: u32, t: f32) -> u32 {
     ch(0) | ch(8) | ch(16)
 }
 
-fn rows(i: usize, cfg: &Config, st: &State, volume_mode: bool) -> Vec<Row> {
+fn rows(i: usize, cfg: &Config, st: &State, volume_mode: bool, frozen: Option<&[Frozen]>) -> Vec<Row> {
     let me = (!cfg.bool("show_self")).then_some(st.self_id);
     let (text, faded, bg) = (cfg.color("color_text"), cfg.color("color_faded"), cfg.color("color_bg"));
+    if let (0, Some(frozen)) = (i, frozen) {
+        // same rows in the same places; only talking state and volume are live
+        return frozen
+            .iter()
+            .map(|f| match f {
+                Frozen::Gap(g) => Row::Gap(*g),
+                Frozen::Speaker { id, whisper, name } => {
+                    let dot = cfg.color(if *whisper { "color_whisper" } else { "color_talk" });
+                    match st.speakers.get(id) {
+                        Some(s) => Row::Item {
+                            text: s.name.clone(),
+                            dot: if s.talking { dot } else { blend(dot, bg, 0.5) },
+                            color: if s.talking { text } else { faded },
+                            id: Some(*id),
+                            volume: Some(s.volume),
+                        },
+                        // left the server meanwhile: keep the row, but the wheel does nothing on it
+                        None => Row::Item { text: name.clone(), dot: blend(dot, bg, 0.2), color: faded, id: None, volume: None },
+                    }
+                }
+            })
+            .collect();
+    }
     if i == 1 {
         let mut people: Vec<_> = st.channel.iter().filter(|(id, _)| Some(*id) != me).collect();
         people.sort_by_key(|(_, n)| n.to_lowercase());
@@ -307,6 +578,22 @@ fn rows(i: usize, cfg: &Config, st: &State, volume_mode: bool) -> Vec<Row> {
         out.push(Row::Item { text: hint, dot: bg, color: faded, id: None, volume: None });
     }
     out
+}
+
+/// The rows a window shows; in arrange mode an empty window gets sample rows, so it can be seen
+/// and grabbed.
+fn shown_rows(ui: &Ui, i: usize) -> Vec<Row> {
+    let cfg = &ui.cfg;
+    let n = rows(i, cfg, &lock(&STATE), i == 0 && ui.volume_mode.is_some(), ui.frozen.as_deref());
+    if !ui.arrange || !n.is_empty() {
+        return n;
+    }
+    let item = |text: &str, dot: &str| Row::Item { text: text.to_string(), dot: cfg.color(dot), color: cfg.color("color_text"), id: None, volume: None };
+    if i == 0 {
+        vec![item("Шёпот", "color_whisper"), Row::Gap(cfg.int("talk_gap").max(0)), item("Кто говорит", "color_talk")]
+    } else {
+        vec![item("Список канала", "color_talk")]
+    }
 }
 
 /// Row height and padding derived from the font size.
@@ -354,8 +641,8 @@ fn layout(i: usize) {
         let ui = ui.as_ref()?;
         let cfg = &ui.cfg;
         let p = PREFIX[i];
-        let n = rows(i, cfg, &lock(&STATE), i == 0 && ui.volume_mode.is_some());
-        if ui.hidden[i] || !cfg.bool(&format!("{p}_enabled")) || n.is_empty() {
+        let n = shown_rows(ui, i);
+        if (ui.hidden[i] && !ui.arrange) || !cfg.bool(&format!("{p}_enabled")) || n.is_empty() {
             return Some((ui.wins[i], None));
         }
         let (row_h, pad) = metrics(cfg.int(&format!("{p}_font_px")).max(6));
@@ -404,7 +691,7 @@ unsafe fn paint(hwnd: HWND, i: usize) {
         let Some(ui) = ui.as_ref() else { return };
         let cfg = &ui.cfg;
         let volume_mode = i == 0 && ui.volume_mode.is_some();
-        let n = rows(i, cfg, &lock(&STATE), volume_mode);
+        let n = shown_rows(ui, i);
         let (row_h, pad) = metrics(cfg.int(&format!("{}_font_px", PREFIX[i])).max(6));
         let d = (pad).max(4);
         let bg = cfg.color("color_bg");
@@ -422,9 +709,10 @@ unsafe fn paint(hwnd: HWND, i: usize) {
             let brush = CreateSolidBrush(bg);
             FillRect(mem, &rc, brush);
             DeleteObject(brush);
-            // volume mode: a thick frame in the talk colour, so it is obvious the window takes the mouse
-            let brush = CreateSolidBrush(cfg.color(if volume_mode { "color_talk" } else { "color_border" }));
-            for k in 0..if volume_mode { 3 } else { 1 } {
+            // volume / arrange mode: a thick frame, so it is obvious the window takes the mouse
+            let frame = if ui.arrange { "color_join" } else if volume_mode { "color_talk" } else { "color_border" };
+            let brush = CreateSolidBrush(cfg.color(frame));
+            for k in 0..if volume_mode || ui.arrange { 3 } else { 1 } {
                 FrameRect(mem, &RECT { left: k, top: k, right: w - k, bottom: h - k }, brush);
             }
             DeleteObject(brush);
@@ -494,15 +782,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             (1 | 2, WM_PAINT) => paint(hwnd, kind as usize - 1),
             (1 | 2, WM_ERASEBKGND) => return 1,
             // the window only gets the mouse in volume mode; it must never take focus from the game
-            (1, WM_MOUSEACTIVATE) => return MA_NOACTIVATE as LRESULT,
-            (1, WM_MOUSEWHEEL) => {
+            (1 | 2, WM_MOUSEACTIVATE) => return MA_NOACTIVATE as LRESULT,
+            (1 | 2, WM_SETCURSOR) if arranging() => {
+                let mut pt = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut pt);
+                ScreenToClient(hwnd, &mut pt);
+                SetCursor(LoadCursorW(std::ptr::null_mut(), edge_cursor(edges_at(hwnd, pt.x, pt.y))));
+                return 1;
+            }
+            (1 | 2, WM_LBUTTONDOWN) if arranging() => {
+                start_drag(hwnd, kind as usize - 1, (lp & 0xffff) as i16 as i32, (lp >> 16 & 0xffff) as i16 as i32)
+            }
+            (1 | 2, WM_LBUTTONUP | WM_CAPTURECHANGED) => end_drag(),
+            (1 | 2, WM_MOUSEMOVE) if arranging() => drag_move(),
+            (1, WM_MOUSEWHEEL) if volume_mode() => {
                 let mut pt = POINT { x: (lp & 0xffff) as i16 as i32, y: (lp >> 16 & 0xffff) as i16 as i32 };
                 ScreenToClient(hwnd, &mut pt);
                 let delta = (wp >> 16 & 0xffff) as i16 as i32;
                 adjust_volume(pt.y, Some(delta.signum() * (delta.abs() / 120).max(1)));
             }
-            (1, WM_RBUTTONUP) => adjust_volume((lp >> 16 & 0xffff) as i16 as i32, None),
+            (1, WM_RBUTTONUP) if volume_mode() => adjust_volume((lp >> 16 & 0xffff) as i16 as i32, None),
+            (1, WM_MOUSEMOVE) => freeze(hwnd),
+            (1, WM_MOUSELEAVE) => unfreeze(),
             (KIND_CONTROL, WM_HOTKEY) if wp == HOTKEY_VOLUME as usize => set_volume_mode(!volume_mode()),
+            (KIND_CONTROL, WM_HOTKEY) if wp == HOTKEY_ARRANGE as usize => set_arrange(!arranging()),
             (KIND_CONTROL, WM_APP_REFRESH) => layout_all(),
             (KIND_CONTROL, WM_APP_RELOAD) => apply_config(hwnd),
             (KIND_CONTROL, WM_TIMER) => expire(),

@@ -33,6 +33,7 @@ pub const SECTIONS: &[(&str, &[Field])] = &[
         Field { key: "opacity", label: "Непрозрачность, %", kind: Kind::Int, default: "92" },
         Field { key: "linger", label: "Держать ник после речи, с", kind: Kind::Int, default: "15" },
         Field { key: "show_self", label: "Показывать себя", kind: Kind::Bool, default: "1" },
+        Field { key: "arrange_hotkey", label: "Клавиша: расположить окна", kind: Kind::Text, default: "Ctrl+Alt+M" },
         Field { key: "color_bg", label: "Фон", kind: Kind::Color, default: "#1E1F22" },
         Field { key: "color_border", label: "Рамка", kind: Kind::Color, default: "#3A3D42" },
         Field { key: "color_text", label: "Текст", kind: Kind::Color, default: "#FFFFFF" },
