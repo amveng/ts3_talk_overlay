@@ -21,7 +21,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::{self, Config};
-use crate::{STATE, State, lock, log};
+use crate::{STATE, State, Tab, lock, log};
 
 const WM_APP_REFRESH: u32 = WM_APP + 1;
 const WM_APP_RELOAD: u32 = WM_APP + 2;
@@ -73,8 +73,12 @@ struct Drag {
     font: i32,
 }
 
+/// A speaker: (server tab, clid).
+type Id = (u64, u16);
+
 enum Frozen {
-    Speaker { id: u16, whisper: bool, name: String },
+    Speaker { id: Id, whisper: bool, name: String },
+    Header(String),
     Gap(i32),
 }
 
@@ -84,7 +88,9 @@ thread_local! {
 
 enum Row {
     /// `id` is the speaker under this row; `volume` is shown on the right in volume mode.
-    Item { text: String, dot: u32, color: u32, id: Option<u16>, volume: Option<i32> },
+    Item { text: String, dot: u32, color: u32, id: Option<Id>, volume: Option<i32> },
+    /// Server tab heading, when more than one tab is connected.
+    Header(String),
     Gap(i32),
 }
 
@@ -434,7 +440,7 @@ fn store_position(cfg: &mut Config, i: usize, x: i32, y: i32, w: i32, h: i32) {
 }
 
 /// Speaker on the "Кто говорит" row at client y, with their current volume.
-fn speaker_at(y: i32) -> Option<(u16, i32)> {
+fn speaker_at(y: i32) -> Option<(Id, i32)> {
     UI.with_borrow(|ui| {
         let ui = ui.as_ref()?;
         let cfg = &ui.cfg;
@@ -444,6 +450,7 @@ fn speaker_at(y: i32) -> Option<(u16, i32)> {
         for row in &n {
             match row {
                 Row::Gap(g) => top += g,
+                Row::Header(_) => top += row_h,
                 Row::Item { id, volume, .. } => {
                     if (top..top + row_h).contains(&y) {
                         return Some(((*id)?, volume.unwrap_or(0)));
@@ -464,7 +471,7 @@ fn adjust_volume(y: i32, notches: Option<i32>) {
         }
     });
     if let Some((id, current)) = speaker_at(y) {
-        crate::set_volume(id, notches.map_or(0, |n| current + n));
+        crate::set_volume(id.0, id.1, notches.map_or(0, |n| current + n));
     }
 }
 
@@ -477,8 +484,10 @@ fn freeze(hwnd: HWND) {
             .into_iter()
             .filter_map(|r| match r {
                 Row::Gap(g) => Some(Frozen::Gap(g)),
+                Row::Header(h) => Some(Frozen::Header(h)),
                 Row::Item { id: Some(id), text, .. } => {
-                    Some(Frozen::Speaker { id, whisper: st.speakers.get(&id).is_some_and(|s| s.whisper), name: text })
+                    let sp = st.tabs.get(&id.0).and_then(|t| t.speakers.get(&id.1));
+                    Some(Frozen::Speaker { id, whisper: sp.is_some_and(|s| s.whisper), name: text })
                 }
                 Row::Item { id: None, .. } => None,
             })
@@ -514,17 +523,18 @@ fn blend(a: u32, b: u32, t: f32) -> u32 {
 }
 
 fn rows(i: usize, cfg: &Config, st: &State, volume_mode: bool, frozen: Option<&[Frozen]>) -> Vec<Row> {
-    let me = (!cfg.bool("show_self")).then_some(st.self_id);
     let (text, faded, bg) = (cfg.color("color_text"), cfg.color("color_faded"), cfg.color("color_bg"));
+    let speaker = |id: &Id| st.tabs.get(&id.0).and_then(|t| t.speakers.get(&id.1));
     if let (0, Some(frozen)) = (i, frozen) {
         // same rows in the same places; only talking state and volume are live
         return frozen
             .iter()
             .map(|f| match f {
                 Frozen::Gap(g) => Row::Gap(*g),
+                Frozen::Header(h) => Row::Header(h.clone()),
                 Frozen::Speaker { id, whisper, name } => {
-                    let dot = cfg.color(if *whisper { "color_whisper" } else { "color_talk" });
-                    match st.speakers.get(id) {
+                    let dot = cfg.color(voice_color(*whisper, id.0 != st.active));
+                    match speaker(id) {
                         Some(s) => Row::Item {
                             text: s.name.clone(),
                             dot: if s.talking { dot } else { blend(dot, bg, 0.5) },
@@ -539,24 +549,65 @@ fn rows(i: usize, cfg: &Config, st: &State, volume_mode: bool, frozen: Option<&[
             })
             .collect();
     }
-    if i == 1 {
-        let mut people: Vec<_> = st.channel.iter().filter(|(id, _)| Some(*id) != me).collect();
-        people.sort_by_key(|(_, n)| n.to_lowercase());
-        return people
-            .into_iter()
-            .map(|(id, name)| {
-                let talking = st.speakers.get(id).is_some_and(|s| s.talking && !s.whisper);
-                let dot = if talking { cfg.color("color_talk") } else { blend(faded, bg, 0.35) };
-                let color = if st.joined.contains_key(id) { cfg.color("color_join") } else { text };
-                Row::Item { text: name.clone(), dot, color, id: None, volume: None }
-            })
-            .collect();
+    // One block per tab, the active tab first; headings only when more than one is connected.
+    let headings = st.tabs.len() > 1;
+    let tab_gap = if i == 0 { cfg.int("talk_gap").max(0) } else { cfg.int("list_font_px").max(6) / 2 };
+    let mut out = Vec::new();
+    for (sch, tab) in st.ordered() {
+        let me = (!cfg.bool("show_self")).then_some(tab.self_id);
+        let other = sch != st.active;
+        let block = if i == 1 { list_block(cfg, tab, me, other) } else { talk_block(cfg, sch, tab, me, other, volume_mode) };
+        if block.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(Row::Gap(tab_gap));
+        }
+        if headings {
+            out.push(Row::Header(tab.name.clone()));
+        }
+        out.extend(block);
     }
-    // Whispers first, then a gap, then channel voice; within each group live speakers above
-    // lingering ones, newest first.
+    if i == 0 && volume_mode && out.is_empty() {
+        let hint = "Громкость: никто не говорит".to_string();
+        out.push(Row::Item { text: hint, dot: bg, color: faded, id: None, volume: None });
+    }
+    out
+}
+
+/// Dot colour of a speaker: whisper, channel voice on the active tab, or channel voice on another
+/// tab (`other`).
+fn voice_color(whisper: bool, other: bool) -> &'static str {
+    match (whisper, other) {
+        (true, _) => "color_whisper",
+        (false, false) => "color_talk",
+        (false, true) => "color_other_tab",
+    }
+}
+
+/// "Список канала" rows of one tab: everyone in our channel, by name.
+fn list_block(cfg: &Config, tab: &Tab, me: Option<u16>, other: bool) -> Vec<Row> {
+    let (text, faded, bg) = (cfg.color("color_text"), cfg.color("color_faded"), cfg.color("color_bg"));
+    let mut people: Vec<_> = tab.channel.iter().filter(|(id, _)| Some(*id) != me).collect();
+    people.sort_by_key(|(_, n)| n.to_lowercase());
+    people
+        .into_iter()
+        .map(|(id, name)| {
+            let talking = tab.speakers.get(id).is_some_and(|s| s.talking && !s.whisper);
+            let dot = if talking { cfg.color(voice_color(false, other)) } else { blend(faded, bg, 0.35) };
+            let color = if tab.joined.contains_key(id) { cfg.color("color_join") } else { text };
+            Row::Item { text: name.clone(), dot, color, id: None, volume: None }
+        })
+        .collect()
+}
+
+/// "Кто говорит" rows of one tab: whispers first, then a gap, then channel voice; within each
+/// group live speakers above lingering ones, newest first.
+fn talk_block(cfg: &Config, sch: u64, tab: &Tab, me: Option<u16>, other: bool, volume_mode: bool) -> Vec<Row> {
+    let (text, faded, bg) = (cfg.color("color_text"), cfg.color("color_faded"), cfg.color("color_bg"));
     let mut out = Vec::new();
     for whisper in [true, false] {
-        let mut group: Vec<_> = st.speakers.iter().filter(|(id, s)| s.whisper == whisper && Some(**id) != me).collect();
+        let mut group: Vec<_> = tab.speakers.iter().filter(|(id, s)| s.whisper == whisper && Some(**id) != me).collect();
         group.sort_by(|(_, a), (_, b)| b.talking.cmp(&a.talking).then(a.since.elapsed().cmp(&b.since.elapsed())));
         if group.is_empty() {
             continue;
@@ -564,18 +615,14 @@ fn rows(i: usize, cfg: &Config, st: &State, volume_mode: bool, frozen: Option<&[
         if !out.is_empty() {
             out.push(Row::Gap(cfg.int("talk_gap").max(0)));
         }
-        let dot = cfg.color(if whisper { "color_whisper" } else { "color_talk" });
+        let dot = cfg.color(voice_color(whisper, other));
         out.extend(group.into_iter().map(|(id, s)| Row::Item {
             text: s.name.clone(),
             dot: if s.talking { dot } else { blend(dot, bg, 0.5) },
             color: if s.talking { text } else { faded },
-            id: Some(*id),
+            id: Some((sch, *id)),
             volume: volume_mode.then_some(s.volume),
         }));
-    }
-    if volume_mode && out.is_empty() {
-        let hint = "Громкость: никто не говорит".to_string();
-        out.push(Row::Item { text: hint, dot: bg, color: faded, id: None, volume: None });
     }
     out
 }
@@ -722,6 +769,14 @@ unsafe fn paint(hwnd: HWND, i: usize) {
             for row in &n {
                 match row {
                     Row::Gap(g) => y += g,
+                    Row::Header(h) => {
+                        // the tab heading: faded, no dot, from the left edge
+                        SetTextColor(mem, cfg.color("color_faded"));
+                        let mut t: Vec<u16> = h.encode_utf16().collect();
+                        let mut r = RECT { left: pad, top: y, right: w - pad, bottom: y + row_h };
+                        DrawTextW(mem, t.as_mut_ptr(), t.len() as i32, &mut r, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                        y += row_h;
+                    }
                     Row::Item { text, dot: c, color, volume, .. } => {
                         dot(mem, pad, y + (row_h - d) / 2, d, *c, bg);
                         let mut right = w - pad;
@@ -765,10 +820,14 @@ fn expire() {
     let (linger, join) = (secs("linger"), secs("list_join_secs"));
     let changed = {
         let mut s = lock(&STATE);
-        let before = (s.speakers.len(), s.joined.len());
-        s.speakers.retain(|_, sp| volume_mode || sp.talking || sp.since.elapsed() < linger);
-        s.joined.retain(|_, t| t.elapsed() < join);
-        (s.speakers.len(), s.joined.len()) != before
+        let mut changed = false;
+        for tab in s.tabs.values_mut() {
+            let before = (tab.speakers.len(), tab.joined.len());
+            tab.speakers.retain(|_, sp| volume_mode || sp.talking || sp.since.elapsed() < linger);
+            tab.joined.retain(|_, t| t.elapsed() < join);
+            changed |= (tab.speakers.len(), tab.joined.len()) != before;
+        }
+        changed
     };
     if changed {
         layout_all();
@@ -821,5 +880,54 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             _ => return DefWindowProcW(hwnd, msg, wp, lp),
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Speaker;
+
+    fn tab(name: &str, speakers: &[(u16, &str, bool)], channel: &[(u16, &str)]) -> Tab {
+        let mut t = Tab { name: name.to_string(), self_id: 99, ..Default::default() };
+        for &(id, n, whisper) in speakers {
+            t.speakers.insert(id, Speaker { name: n.to_string(), talking: true, whisper, since: Instant::now(), volume: 0 });
+        }
+        t.channel = channel.iter().map(|&(id, n)| (id, n.to_string())).collect();
+        t
+    }
+
+    /// Text of each row: "#heading", "name", or "-" for a gap.
+    fn texts(rows: &[Row]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                Row::Header(h) => format!("#{h}"),
+                Row::Item { text, .. } => text.clone(),
+                Row::Gap(_) => "-".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tabs_are_grouped_under_headings_active_first() {
+        let cfg = config::current();
+        let mut st = State { active: 2, ..Default::default() };
+        st.tabs.insert(1, tab("Первый", &[(5, "Ворон", true), (6, "Grom", false)], &[(5, "Ворон"), (7, "Тихоня")]));
+        st.tabs.insert(2, tab("Второй", &[(5, "Лиса", false)], &[(8, "Мельник")]));
+        assert_eq!(texts(&rows(0, &cfg, &st, false, None)), ["#Второй", "Лиса", "-", "#Первый", "Ворон", "-", "Grom"]);
+        assert_eq!(texts(&rows(1, &cfg, &st, false, None)), ["#Второй", "Мельник", "-", "#Первый", "Ворон", "Тихоня"]);
+        // the same clid on two tabs is two different people
+        let ids: Vec<_> = rows(0, &cfg, &st, false, None).iter().filter_map(|r| if let Row::Item { id, .. } = r { *id } else { None }).collect();
+        assert_eq!(ids, [(2, 5), (1, 5), (1, 6)]);
+        // channel voice: green on the active tab, its own colour on another; a whisper stays a whisper
+        let dots: Vec<_> = rows(0, &cfg, &st, false, None).iter().filter_map(|r| if let Row::Item { dot, .. } = r { Some(*dot) } else { None }).collect();
+        assert_eq!(dots, [cfg.color("color_talk"), cfg.color("color_whisper"), cfg.color("color_other_tab")]);
+
+        // one tab: no heading, looks as before
+        st.tabs.remove(&2);
+        assert_eq!(texts(&rows(0, &cfg, &st, false, None)), ["Ворон", "-", "Grom"]);
+        // a tab with nobody talking gets no block at all
+        st.tabs.insert(3, tab("Третий", &[], &[]));
+        assert_eq!(texts(&rows(0, &cfg, &st, false, None)), ["#Первый", "Ворон", "-", "Grom"]);
     }
 }

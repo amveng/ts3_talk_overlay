@@ -41,6 +41,7 @@ pub const SECTIONS: &[(&str, &[Field])] = &[
         Field { key: "color_join", label: "Текст (только зашёл)", kind: Kind::Color, default: "#4FC3F7" },
         Field { key: "color_talk", label: "Точка: канал", kind: Kind::Color, default: "#00E676" },
         Field { key: "color_whisper", label: "Точка: шёпот", kind: Kind::Color, default: "#FFB300" },
+        Field { key: "color_other_tab", label: "Точка: канал другой вкладки", kind: Kind::Color, default: "#B388FF" },
     ]),
     ("Кто говорит", &[
         Field { key: "talk_enabled", label: "Включён", kind: Kind::Bool, default: "1" },

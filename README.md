@@ -9,6 +9,7 @@ A TeamSpeak 3 plugin that shows on top of your game who is talking in TeamSpeak 
 - **"Кто говорит" (Talking)**: who is talking right now. Whispers on top (orange dot), channel voice below (green dot). Someone who has just stopped stays visible, dimmed, for a few seconds.
 - **"Список канала" (Channel list)**: everyone in your channel. The dot turns green while that person talks. Someone who has just joined is highlighted in blue.
 - **Per-person volume** can be changed right from the Talking window with the mouse wheel.
+- **Several server tabs:** when TeamSpeak is connected to more than one server, both windows show every tab under a heading with the server address (as on the TeamSpeak tab), the active tab first. Channel voice from the other tabs gets its own dot colour (purple by default, set in the settings).
 
 The windows do not get in the way of the game: clicks pass through them and they never take focus. The game must run in borderless windowed mode; in exclusive fullscreen the windows end up under the game.
 
@@ -73,6 +74,7 @@ The plugin only reads data from TeamSpeak on this computer and draws the windows
 - **«Кто говорит»**: кто говорит прямо сейчас. Шёпот наверху (оранжевая точка), ниже голос в канале (зелёная точка). Замолчавший ещё несколько секунд виден приглушённым.
 - **«Список канала»**: все, кто в вашем канале. У говорящего точка загорается зелёным. Ник того, кто только что зашёл, подсвечивается голубым.
 - **Громкость отдельного человека** меняется прямо из окна «Кто говорит», колесом мыши.
+- **Несколько вкладок:** если TeamSpeak подключён к нескольким серверам, оба окна показывают все вкладки, у каждой заголовок с адресом сервера (как на вкладке TeamSpeak); активная вкладка сверху. Голос в канале на других вкладках отмечается своим цветом точки (по умолчанию фиолетовым, меняется в настройках).
 
 Окна не мешают игре: клики проходят сквозь них, фокус они не забирают. Игра должна быть в режиме «Оконный без рамки» (Borderless). В полноэкранном режиме окна окажутся под игрой.
 
